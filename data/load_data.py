@@ -51,8 +51,12 @@ class Load_Blender():
         self.imgs_test, self.name_test, self.intrs_test, self.intrs_inv_test, self.c2ws_test, self.test_num = self.load_json('transforms_test.json')
         self.imgs_val, self.name_val, self.intrs_val, self.intrs_inv_val, self.c2ws_val, self.val_num = self.load_json('transforms_val.json')
         _, _, self.img_h, self.img_w = self.imgs_train.shape
+        self.radius = max_camera_distance_pairwise(self.c2ws_train)
+        self.scene_center, self.scene_radius = compute_center_radius(self.c2ws_train, scale=1.1)
         # 相机外参进行pca操作
         self.c2ws_pca_train, transform_mat, scale_factor = transform_poses_pca(self.c2ws_train)
+        self.radius_pca = max_camera_distance_pairwise(self.c2ws_pca_train)
+        self.scene_center_pca, self.scene_radius_pca = compute_center_radius(self.c2ws_pca_train, scale=1.1)
         self.c2ws_pca_test = apply_pca(self.c2ws_test, transform_mat, scale_factor)
         self.c2ws_pca_val = apply_pca(self.c2ws_val, transform_mat, scale_factor)
         self.idx_train, self.idx_test, self.idx_val = torch.arange(0, self.train_num), torch.arange(0, self.test_num), torch.arange(0, self.val_num)
@@ -613,6 +617,21 @@ def inverse_transform_pca(poses_recentered, transform_mat, scale_factor):
     poses_original = torch.matmul(transform_inv.unsqueeze(0), poses_recentered.clone())
     poses_original[:, 3, :] = torch.tensor([0, 0, 0, 1.0])
     return poses_original
+
+def compute_center_radius(c2ws_train, scale=1.2, eps=1e-6):
+    centers = c2ws_train[:, :3, 3]                              # [N, 3]
+    scene_min = centers.min(dim=0).values
+    scene_max = centers.max(dim=0).values 
+    scene_center = (scene_min + scene_max) * 0.5
+    scene_radius = (scene_max - scene_min).max() * 0.5
+    scene_radius = torch.clamp(scene_radius * scale, min=eps)
+    return scene_center, scene_radius
+
+def max_camera_distance_pairwise(c2ws_train):
+    centers = c2ws_train[:, :3, 3]                              # [N, 3]
+    diff = centers[:, None, :] - centers[None, :, :]            # [N, N, 3]
+    dists = torch.linalg.norm(diff, dim=-1)                     # [N, N]
+    return dists.max()
 
 def qvec2rotmat(qvec):
     return torch.tensor([
