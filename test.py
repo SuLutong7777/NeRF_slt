@@ -17,12 +17,15 @@ class Model_Tester():
         self.batch_size = self.sys_param['batch_size']
         self.output_path = self.sys_param['output_path']
         self.test_root = os.path.join(self.output_path, "test")
-        self.only_coarse = self.sys_param['only_coarse']
         os.makedirs(self.test_root, exist_ok=True)
         # 加载数据集
         self.dataset = Data_set(self.sys_param)
         # 初始化模型
         self.nerf = NeRF_Model(self.sys_param, load_weights=True).to(self.device)
+        load_weights_path = self.sys_param['test_model_path']
+        nerfkpt_file = torch.load(load_weights_path, map_location = self.device)
+        nerfkpt_dict = nerfkpt_file['model_nerf']
+        self.nerf.load_state_dict(nerfkpt_dict, strict=False)
         self.nerf.eval()
     
     def forward(self):
@@ -44,13 +47,11 @@ class Model_Tester():
                         else:
                             select_rays_o = rays_o[i*self.batch_size:(i+1)*self.batch_size].to(self.device) # [batch_size, 3]
                             select_rays_d = rays_d[i*self.batch_size:(i+1)*self.batch_size].to(self.device) # [batch_size, 3]
+                        if select_rays_o.shape[0] == 0:
+                            continue
                         # 进入nerf模型
-                        data = self.nerf(select_rays_o, select_rays_d, mode="test")
-                        if self.only_coarse:
-                            rgb, _ = data                                                   # [batch_size, 3]
-                        else:
-                            _, _, rgb, _ = data
-                        rgbs.append(rgb)
+                        outputs = self.nerf(select_rays_o, select_rays_d)
+                        rgbs.append(outputs['pd_rgbs'])
                     rgbs = torch.cat(rgbs, dim=0)                                           # [H*W, 3]
                     test_path = os.path.join(self.test_root, "{:03d}.png".format(i_test))
                     pd_rgb = rgbs.reshape(H, W, -1).permute(2, 0, 1)                        # [3, H, W]
