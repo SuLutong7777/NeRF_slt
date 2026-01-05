@@ -9,3 +9,7 @@
 ## v3.0
 1. 该版本在v2.0基础上将 coarse MLP + fine MLP 二次采样改为 proposal MLP + render MLP二次采样
 2. 仅支持Blender_synthetic数据集
+
+## v4.0
+1. 该版本在v2.0基础上加入位姿学习
+2. 仅支持Blender_synthetic数据集

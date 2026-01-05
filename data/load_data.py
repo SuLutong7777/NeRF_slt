@@ -14,6 +14,7 @@ import torchvision.transforms as T
 import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils import init_show_figure, show_camera_position
+from utils import transform_poses_pca, apply_pca, inverse_transform_pca
 
 CameraModel = collections.namedtuple(
     "CameraModel", ["model_id", "model_name", "num_params"])
@@ -52,9 +53,9 @@ class Load_Blender():
         self.imgs_val, self.name_val, self.intrs_val, self.intrs_inv_val, self.c2ws_val, self.val_num = self.load_json('transforms_val.json')
         _, _, self.img_h, self.img_w = self.imgs_train.shape
         # 相机外参进行pca操作
-        self.c2ws_pca_train, transform_mat, scale_factor = transform_poses_pca(self.c2ws_train)
-        self.c2ws_pca_test = apply_pca(self.c2ws_test, transform_mat, scale_factor)
-        self.c2ws_pca_val = apply_pca(self.c2ws_val, transform_mat, scale_factor)
+        self.c2ws_pca_train, self.transform_mat, self.scale_factor = transform_poses_pca(self.c2ws_train)
+        self.c2ws_pca_test = apply_pca(self.c2ws_test, self.transform_mat, self.scale_factor)
+        self.c2ws_pca_val = apply_pca(self.c2ws_val, self.transform_mat, self.scale_factor)
         self.idx_train, self.idx_test, self.idx_val = torch.arange(0, self.train_num), torch.arange(0, self.test_num), torch.arange(0, self.val_num)
         end = time.time()
         print(f"运行时间: {end - start:.2f}秒")
@@ -400,7 +401,7 @@ class Load_mip360():
         intrs = []
         for img in images_list:
             # 外参矩阵
-            R_w2c = qvec2rotmat(img.qvec)                                       # 旋转矩阵
+            R_w2c = self.qvec2rotmat(img.qvec)                                       # 旋转矩阵
             t_w2c = img.tvec.reshape(3, 1)                                      # 平移向量
             c2w = torch.diag(torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32))
             c2w[:3, :3] = R_w2c.T
@@ -437,7 +438,19 @@ class Load_mip360():
         c2ws_tensor = torch.stack(c2ws, dim=0)              # [N, 4, 4]
         intrs_tensor = torch.stack(intrs, dim=0)            # [N, 3, 3]
         intrs_tensor_inv = torch.linalg.inv(intrs_tensor)   # [N, 3, 3]
-        return c2ws_tensor, intrs_tensor, intrs_tensor_inv           
+        return c2ws_tensor, intrs_tensor, intrs_tensor_inv       
+
+    def qvec2rotmat(self, qvec):
+        return torch.tensor([
+            [1 - 2 * qvec[2]**2 - 2 * qvec[3]**2,
+            2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+            2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2]],
+            [2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+            1 - 2 * qvec[1]**2 - 2 * qvec[3]**2,
+            2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1]],
+            [2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
+            2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+            1 - 2 * qvec[1]**2 - 2 * qvec[2]**2]], dtype=torch.float32)    
 
 class Colmap_data():
     def __init__(self, colmap_path):
@@ -526,102 +539,20 @@ class Colmap_data():
         # 返回解包数据，一个元组
         return struct.unpack(endian_character + format_char_sequence, data)
 
-# COLMAP产生的相机位姿的世界坐标系不一定是啥样
-# 这个操作将COLMAP生成的坐标系进行转换，变成以环绕中心为世界坐标系原点的全新分布坐标
-# pca是指主成分分析，Principal Component Analysis，一种数据降维方法
-# 主成分分析可以看这个：https://zhuanlan.zhihu.com/p/37777074
-# 这段代码实现PAC用的是上面这个链接中3.5的(1)方法
-# 输入poses为[N, 4, 4], 必须为c2w矩阵，不能为w2c
-def transform_poses_pca(poses_c2w):
-    poses_c2w = poses_c2w.detach()
-    # 获取所有相机的中心点
-    trans = poses_c2w[:, :3, 3]
-    # 取平均值
-    trans_mean = torch.mean(trans, dim=0)
-    # 中心化，相当于取所有点的平均中心为新坐标原点
-    # 生成新的相机中心位置 [194, 3]
-    trans = trans - trans_mean
-    # 计算特征值eigval，和特征向量eigvec
-    # 注意，这两个算出来是复数格式，有实部和虚部，即使虚部为0，也会保留
-    # 所以这里要除去虚部(虚部全部算出来都是0)
-    # trans.T @ trans: [3,3], 注意，这个过程在计算平移向量集合的协方差（正常有个除以n的系数，但是不影响特征向量）
-    # eigval:[3], eigvec:[3,3]
-    # eigval, eigvec = torch.linalg.eig(trans.T @ trans)
-    # 转成Numpy做，pytorch版本的特征向量符号与Numpy不一致
-    eigval, eigvec = np.linalg.eig(trans.cpu().numpy().T @ trans.cpu().numpy())
-    eigval = torch.from_numpy(eigval)
-    eigvec = torch.from_numpy(eigvec)
-    # print(eigval, eigvec)
-    # exit()
-    # 对所有特征值进行从大到小的排序，获取排序的索引
-    inds = torch.argsort(eigval.real, descending=True)
-    # 同时排序特征向量
-    # eigvec = eigvec[:, inds].real
-    eigvec = eigvec[:, inds]
-    # print(eigvec, "2222")
-    # 将特征向量转置，构造投影矩阵，将所有坐标点投影到新的坐标系下
-    # 这个新的坐标系的轴就是数据的主成分轴。
-    # 这里eigvec为[3,3]，因为数据一共有三个主成分，分别为x,y,z，都需要保留，所以上面链接中的k值取3，就等同于不用筛选
-    # eigvec中，每一列是特征向量，转置之后变成行，在进行投影的时候就是rot@trans，x,y,z维度能对应
-    rot = eigvec.T
-    # 保持坐标系变换后与原来规则相同
-    # 在三维空间中，一个合法的旋转矩阵应该是正交的且行列式为1，这保证了坐标系变换保持了空间的右手规则。
-    # 如果行列式小于0，表明旋转矩阵将导致坐标系翻转，违反了右手规则。
-    # 一个矩阵的行列式（np.linalg.det(rot)）告诉我们这个矩阵是保持空间的定向（右手或左手）不变还是改变了空间的定向。具体来说：
-    # 如果行列式大于0，说明变换后的坐标系保持原有的定向（即如果原坐标系是右手的，变换后仍然是右手的）。
-    # 如果行列式小于0，说明变换后的坐标系改变了原有的定向（即从右手变为了左手，或从左手变为了右手）。
-    if torch.linalg.det(rot) < 0:
-        rot = torch.diag(torch.tensor([1.0, 1.0, -1.0])) @ rot
 
-    # 构建完整的[R|T]变换矩阵，直接针对原始的pose信息，不再单纯考虑trans
-    # 尺寸是[3, 4]
-    transform_mat = torch.cat([rot, rot @ -trans_mean[:, None]], dim=-1)
-    # 转为[4, 4]
-    transform_mat = torch.cat([transform_mat, torch.tensor([[0, 0, 0, 1.]])], dim=0)
-    # 整体RT矩阵转换[N, 4, 4]
-    # poses_recentered = transform_mat @ poses_c2w
-    poses_recentered = torch.matmul(transform_mat.unsqueeze(0), poses_c2w)
-    # 检查坐标轴方向
-    # 检查在新坐标系中，相机指向的平均方向的y分量是否向下。如果是的话，这意味着变换后的位姿与常规的几何或物理约定（例如，通常期望的y轴向上）不符。
-    if poses_recentered.mean(axis=0)[2, 1] < 0:
-        poses_recentered = torch.diag(torch.tensor([1.0, -1.0, -1.0, 1.0])) @ poses_recentered
-        transform_mat = torch.diag(torch.tensor([1.0, -1.0, -1.0, 1.0])) @ transform_mat
-        
-    # 原始相机方向向量的平均（这里假设第三列是前向向量）
-    orig_forward = poses_c2w[:, :3, 2].mean(0)
-    new_forward = poses_recentered[:, :3, 2].mean(0)
-    # 如果方向相反（dot product < 0），就翻转 Z 和 X（保持右手系）
-    if (orig_forward @ new_forward) < 0:
-        poses_recentered = torch.diag(torch.tensor([-1.0, 1.0, -1.0, 1.0])) @ poses_recentered
-        transform_mat = torch.diag(torch.tensor([-1.0, 1.0, -1.0, 1.0])) @ transform_mat
-    # 对数据进行归一化，收敛到[-1, 1]之间
-    scale_factor = 1. / torch.max(torch.abs(poses_recentered[:, :3, 3]))
-    poses_recentered[:, :3, 3] *= scale_factor
-    poses_recentered[:, 3, :] = torch.tensor([0.0, 0.0, 0.0, 1.0]).repeat(poses_recentered.shape[0], 1)
-    # transform_mat = torch.diag(torch.tensor([scale_factor] * 3 + [1])) @ transform_mat
-    
-    return poses_recentered, transform_mat, scale_factor
+def compute_center_radius(c2ws_train, scale=1.2, eps=1e-6):
+    centers = c2ws_train[:, :3, 3]                              # [N, 3]
+    scene_min = centers.min(dim=0).values
+    scene_max = centers.max(dim=0).values 
+    scene_center = (scene_min + scene_max) * 0.5
+    scene_radius = (scene_max - scene_min).max() * 0.5
+    scene_radius = torch.clamp(scene_radius * scale, min=eps)
+    return scene_center, scene_radius
 
-def apply_pca(poses_c2ws, trans, scale):
-    c2ws_pca = trans @ poses_c2ws
-    c2ws_pca[:, :3, 3] *= scale
-    return c2ws_pca
+def max_camera_distance_pairwise(c2ws_train):
+    centers = c2ws_train[:, :3, 3]                              # [N, 3]
+    diff = centers[:, None, :] - centers[None, :, :]            # [N, N, 3]
+    dists = torch.linalg.norm(diff, dim=-1)                     # [N, N]
+    return dists.max()
 
-def inverse_transform_pca(poses_recentered, transform_mat, scale_factor):
-    poses_recentered[:, :3, 3] /= scale_factor
-    transform_inv = torch.linalg.inv(transform_mat)
-    poses_original = torch.matmul(transform_inv.unsqueeze(0), poses_recentered.clone())
-    poses_original[:, 3, :] = torch.tensor([0, 0, 0, 1.0])
-    return poses_original
 
-def qvec2rotmat(qvec):
-    return torch.tensor([
-        [1 - 2 * qvec[2]**2 - 2 * qvec[3]**2,
-         2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
-         2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2]],
-        [2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
-         1 - 2 * qvec[1]**2 - 2 * qvec[3]**2,
-         2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1]],
-        [2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
-         2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
-         1 - 2 * qvec[1]**2 - 2 * qvec[2]**2]], dtype=torch.float32)
